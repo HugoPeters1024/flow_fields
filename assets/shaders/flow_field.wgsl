@@ -1,11 +1,25 @@
 struct Particle {
   position: vec2<f32>,
   velocity: vec2<f32>,
+  seed: u32,
 }
 
 @group(0) @binding(0) var dst_image: texture_storage_2d<rgba32float, read_write>;
-@group(0) @binding(0) var dst_image: texture_storage_2d<rgba32float, read_write>;
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
+@group(0) @binding(2) var<storage, read_write> energy_buffer: array<atomic<u32>>;
+
+fn xxhash32(n: u32) -> u32 {
+    var h32 = n + 374761393u;
+    h32 = 668265263u * ((h32 << 17u) | (h32 >> (32u - 17u)));
+    h32 = 2246822519u * (h32 ^ (h32 >> 15u));
+    h32 = 3266489917u * (h32 ^ (h32 >> 13u));
+    return h32^(h32 >> 16u);
+}
+
+fn randf(n: u32) -> f32 {
+  particles[n].seed = xxhash32(particles[n].seed);
+  return f32(particles[n].seed) / 4294967296.0;
+}
 
 //  MIT License. © Ian McEwan, Stefan Gustavson, Munrocket, Johan Helsing
 //
@@ -75,42 +89,40 @@ fn update(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
 
     let plocf = vec2<f32>(particle.position) / 100.0;
 
-    let angle = simplexNoise2(plocf / 5.0) * 3.14159;
+    let angle = simplexNoise2(plocf / 2.8) * 3.14159;
     let dir = vec2<f32>(cos(angle), sin(angle));
 
     let alpha = 0.01;
 
     particles[pid].velocity = (particles[pid].velocity * (1.0 - alpha)) + (dir * alpha);
-    particles[pid].position += particles[pid].velocity;
+    particles[pid].position += particles[pid].velocity * 0.3;
 
-    if (particles[pid].position.x > 1280.0) {
-        particles[pid].position.x = 0.0;
+    if (particles[pid].position.x >= 1280.0
+       || particles[pid].position.x < 0.0
+       || particles[pid].position.y >= 720.0
+       || particles[pid].position.y < 0.0) {
+        particles[pid].position.x = randf(pid) * 1280.0;
+        particles[pid].position.y = randf(pid) * 720.0;
+        particles[pid].velocity.x = randf(pid) * 2.0 - 1.0;
+        particles[pid].velocity.y = randf(pid) * 2.0 - 1.0;
     }
-    if (particles[pid].position.x < 0.0) {
-        particles[pid].position.x = 1280.0;
-    }
-    if (particles[pid].position.y > 720.0) {
-        particles[pid].position.y = 0.0;
-    }
-    if (particles[pid].position.y < 0.0) {
-        particles[pid].position.y = 720.0;
-    }
+
+    let p = particles[pid].position;
+
+    var oldValue: u32 = atomicAdd(&energy_buffer[u32(p.x) + #{SCREEN_WIDTH}u * u32(p.y)], 1u);
 }
 
-@compute @workgroup_size(256,1,1)
+@compute @workgroup_size(16,16,1)
 fn draw(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
-    let particle = particles[invocation_id.x];
+    let pxl_id = invocation_id.x + #{SCREEN_WIDTH}u * invocation_id.y;
+    let energy : u32 = atomicLoad(&energy_buffer[pxl_id]);
 
-    let pposu = vec2<u32>(u32(particle.position.x), u32(particle.position.y));
-
-    textureStore(dst_image, pposu, vec4(5, 1.0));
+    textureStore(dst_image, vec2(invocation_id.x, invocation_id.y), vec4(vec3(0.0, 0.0, 0.01) + vec3(1.0) * f32(energy)/1000.0, 1.0));
 }
 
 @compute @workgroup_size(16,16,1)
 fn clear(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     let location = vec2<u32>(invocation_id.xy);
     let locationf = vec2<f32>(location) / 130.0;
-
-    let old = textureLoad(dst_image, pposu).xyz;
-    textureStore(dst_image, location, vec4(vec3(old.a * 0.999), old.a));
+    textureStore(dst_image, location, vec4(vec3(0.0), 1.0));
 }

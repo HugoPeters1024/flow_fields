@@ -11,9 +11,9 @@ use bevy::{
             BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Buffer,
             BufferBinding, BufferBindingType, BufferInitDescriptor, BufferUsages,
             CachedComputePipelineId, CachedPipelineState, ComputePassDescriptor,
-            ComputePipelineDescriptor, Extent3d, PipelineCache, ShaderStages, ShaderType,
-            StorageTextureAccess, TextureDimension, TextureFormat, TextureUsages,
-            TextureViewDimension,
+            ComputePipelineDescriptor, Extent3d, PipelineCache, ShaderDefVal, ShaderStages,
+            ShaderType, StorageTextureAccess, TextureDimension, TextureFormat, TextureUsages,
+            TextureViewDimension, BufferDescriptor,
         },
         renderer::RenderDevice,
         Render, RenderApp, RenderSet,
@@ -22,7 +22,7 @@ use bevy::{
 
 const SIZE: (u32, u32) = (1280, 720);
 const WORKGROUP_SIZE: u32 = 256;
-const NR_PARTICLES: u32 = WORKGROUP_SIZE * 256;
+const NR_PARTICLES: u32 = WORKGROUP_SIZE * 128;
 
 #[derive(Resource, Clone, ExtractResource)]
 pub struct ComputeInput {
@@ -48,12 +48,16 @@ pub struct ComputeNode {
 }
 
 #[derive(Clone, Resource, ExtractResource)]
-pub struct ParticleBuffer(Buffer);
+pub struct ParticleBuffer {
+    particles: Buffer,
+    energies: Buffer,
+}
 
 #[derive(Clone, Copy, ShaderType)]
 pub struct Particle {
     position: Vec2,
     velocity: Vec2,
+    seed: u32,
 }
 
 pub fn main() {
@@ -76,7 +80,7 @@ fn setup(
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        &[0; 4*4],
+        &[0; 4 * 4],
         TextureFormat::Rgba32Float,
     );
 
@@ -94,30 +98,47 @@ fn setup(
         ..default()
     });
 
-    let mut particles = [Particle {
+    let mut particles = vec![Particle {
         position: Vec2::ZERO,
         velocity: Vec2::ZERO,
+        seed: 0,
     }; NR_PARTICLES as usize];
 
-    for p in &mut particles {
+    for (i, p) in &mut particles.iter_mut().enumerate() {
         p.position = Vec2::new(
             rand::random::<f32>() * SIZE.0 as f32,
             rand::random::<f32>() * SIZE.1 as f32,
         );
+        p.velocity = Vec2::new(
+            rand::random::<f32>(),
+            rand::random::<f32>(),
+        );
+
+        p.seed = i as u32;
     }
 
-    let mut byte_buffer: Vec<u8> = Vec::new();
-    let mut buffer = encase::StorageBuffer::new(&mut byte_buffer);
-    buffer.write(&particles).unwrap();
-    let storage = render_device.create_buffer_with_data(&BufferInitDescriptor {
+    let mut particle_byte_buffer: Vec<u8> = Vec::new();
+    let mut particle_buffer = encase::StorageBuffer::new(&mut particle_byte_buffer);
+    particle_buffer.write(&particles).unwrap();
+    let particle_storage = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: None,
         usage: BufferUsages::STORAGE,
-        contents: buffer.into_inner(),
+        contents: particle_buffer.into_inner(),
+    });
+
+    let energy_storage = render_device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: (4 * SIZE.0 * SIZE.1) as u64,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
     });
 
     commands.spawn(Camera2dBundle::default());
 
-    commands.insert_resource(ParticleBuffer(storage));
+    commands.insert_resource(ParticleBuffer {
+        particles: particle_storage,
+        energies: energy_storage,
+    });
     commands.insert_resource(ComputeInput { dst_image: image });
 }
 
@@ -141,7 +162,15 @@ fn prepare_bind_group(
             BindGroupEntry {
                 binding: 1,
                 resource: BindingResource::Buffer(BufferBinding {
-                    buffer: &particles.0,
+                    buffer: &particles.particles,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::Buffer(BufferBinding {
+                    buffer: &particles.energies,
                     offset: 0,
                     size: None,
                 }),
@@ -201,36 +230,40 @@ impl FromWorld for ComputePipeline {
                             },
                             count: None,
                         },
+                        BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: ShaderStages::COMPUTE,
+                            ty: BindingType::Buffer {
+                                ty: BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
         let shader = world
             .resource::<AssetServer>()
             .load("shaders/flow_field.wgsl");
         let pipeline_cache = world.resource::<PipelineCache>();
-        let update_program = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![bind_group_layout.clone()],
-            push_constant_ranges: Vec::new(),
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Cow::from("update"),
-        });
-        let draw_program = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![bind_group_layout.clone()],
-            push_constant_ranges: Vec::new(),
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Cow::from("draw"),
-        });
-        let clear_program = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![bind_group_layout.clone()],
-            push_constant_ranges: Vec::new(),
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Cow::from("clear"),
-        });
+        let from_entrypoint = |entry_point: &'static str| -> ComputePipelineDescriptor {
+            ComputePipelineDescriptor {
+                label: None,
+                layout: vec![bind_group_layout.clone()],
+                push_constant_ranges: Vec::new(),
+                shader: shader.clone(),
+                shader_defs: vec![
+                    ShaderDefVal::UInt("NR_PARTICLES".to_string(), NR_PARTICLES),
+                    ShaderDefVal::UInt("NR_PIXELS".to_string(), SIZE.0 * SIZE.1),
+                    ShaderDefVal::UInt("SCREEN_WIDTH".to_string(), SIZE.0),
+                ],
+                entry_point: Cow::from(entry_point),
+            }
+        };
+
+        let update_program = pipeline_cache.queue_compute_pipeline(from_entrypoint("update"));
+        let draw_program = pipeline_cache.queue_compute_pipeline(from_entrypoint("draw"));
+        let clear_program = pipeline_cache.queue_compute_pipeline(from_entrypoint("clear"));
 
         ComputePipeline {
             bind_group_layout,
@@ -292,7 +325,7 @@ impl render_graph::Node for ComputeNode {
         pass.set_pipeline(clear_program);
         pass.dispatch_workgroups(SIZE.0 / 16, SIZE.1 / 16, 1);
         pass.set_pipeline(draw_program);
-        pass.dispatch_workgroups(NR_PARTICLES / WORKGROUP_SIZE, 1, 1);
+        pass.dispatch_workgroups(SIZE.0 / 16, SIZE.1 / 16, 1);
 
         Ok(())
     }
